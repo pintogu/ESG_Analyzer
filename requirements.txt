@@ -1,0 +1,13 @@
+streamlit>=1.37
+pandas>=2.1
+numpy>=1.26
+plotly>=5.24
+pymupdf>=1.24
+langdetect>=1.0.9
+scikit-learn>=1.4
+rapidfuzz>=3.9
+python-dotenv>=1.0
+transformers>=4.43
+sentencepiece>=0.2.0
+torch
+
