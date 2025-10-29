@@ -1,469 +1,341 @@
-"""
-Streamlit ESG Analyzer
-======================
-Purpose: Upload one or more sustainability reports (any language), analyze content, and output
-homogeneous ESG ratings, comparable dashboards, and extracted risk highlights.
+# === RiskRanger app.py ===
+# Place this file at: riskranger/src/app.py
 
-How to run:
------------
-1) Create a virtual env and install requirements from the block below.
-2) Save this file as app.py
-3) `streamlit run app.py`
-
-Suggested requirements.txt (pin or relax as you prefer):
--------------------------------------------------------
-streamlit>=1.37
-pandas>=2.1
-numpy>=1.26
-plotly>=5.24
-pymupdf>=1.24        # for fast PDF text extraction
-langdetect>=1.0.9    # lightweight language detection
-transformers>=4.43   # (optional) for zero-shot + translation
-sentencepiece>=0.2.0 # if you use MarianMT translation
-torch                # if using transformers locally w/ PyTorch backend
-scikit-learn>=1.4
-python-dotenv>=1.0
-rapidfuzz>=3.9
-"""
-
-from __future__ import annotations
-import os
-import io
-import re
-import json
-import time
-from dataclasses import dataclass, asdict
-from typing import Dict, List, Tuple, Optional
-
-import numpy as np
-import pandas as pd
 import streamlit as st
-import plotly.express as px
-import plotly.graph_objects as go
+import pandas as pd
+import numpy as np
+import re
+from typing import List, Dict, Any
 
-# -----------------------------
-# Optional / lazy-import blocks
-# -----------------------------
-
-def lazy_import_transformers():
-    try:
-        import transformers  # noqa: F401
-        return True
-    except Exception:
-        return False
-
-TRANSFORMERS_OK = lazy_import_transformers()
-
-# -----------------------------
-# Configuration
-# -----------------------------
-
-st.set_page_config(
-    page_title="ESG Analyzer",
-    layout="wide",
+# core helpers you created
+from riskranger_core import (
+    read_pdf_bytes, detect_lang_safe, get_translator, translate_to_en
 )
 
-DEFAULT_WEIGHTS = {
-    "E": 0.4,
-    "S": 0.3,
-    "G": 0.3,
-}
+# ML / viz
+from transformers import pipeline
+from sentence_transformers import SentenceTransformer
+from sklearn.cluster import KMeans
+from sklearn.decomposition import PCA
+import plotly.express as px
 
-SUBWEIGHTS = {
-    "E": {"Emissions": 0.5, "Resources": 0.3, "Pollution": 0.2},
-    "S": {"Labor": 0.4, "Community": 0.3, "Product": 0.3},
-    "G": {"Board": 0.4, "Ethics": 0.3, "RiskMgmt": 0.3},
-}
+# PDF report export
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
+from reportlab.lib.units import cm
 
-RISK_BUCKETS = [
-    "Physical climate risk",
-    "Transition/regulatory risk",
-    "Reputational risk",
-    "Litigation/compliance risk",
-    "Supply chain risk",
-    "Data quality/greenwashing risk",
+# -----------------------------
+# Streamlit page setup
+# -----------------------------
+st.set_page_config(page_title="RiskRanger — AI Risk Intelligence", page_icon="⚡", layout="wide")
+st.title("⚡ RiskRanger — AI Risk Intelligence for Filings & ESG Reports")
+st.caption("Upload PDF/CSV/TXT → detect language → (auto-translate) → classify risks → score severity → cluster & visualize → export.")
+
+# -----------------------------
+# Config / taxonomy
+# -----------------------------
+RISK_LABELS = [
+    "regulatory","climate","cyber","supply chain",
+    "litigation","financial","governance","operational","reputational"
 ]
 
-# Simple keyword seeds per sub-topic (expand / fine-tune for your use case)
-SEEDS = {
-    "Emissions": ["emission", "ghg", "scope 1", "scope 2", "scope 3", "carbon", "co2"],
-    "Resources": ["energy", "renewable", "water", "waste", "recycling", "efficiency"],
-    "Pollution": ["pollution", "spill", "contamin", "air quality", "toxic"],
-    "Labor": ["safety", "injury", "lost time", "union", "wage", "diversity", "inclusion"],
-    "Community": ["community", "stakeholder", "philanthropy", "local", "human rights"],
-    "Product": ["product safety", "recall", "privacy", "data protection"],
-    "Board": ["board", "independent", "chair", "audit committee", "remuneration"],
-    "Ethics": ["bribery", "corruption", "whistleblow", "code of conduct"],
-    "RiskMgmt": ["risk management", "internal control", "materiality", "scenario", "tcfd"],
+LEXICON = {
+    "regulatory": ["regulation","regulatory","compliance","fine","sanction","license","licence","gdpr","antitrust","cross-border","competition authority"],
+    "climate": ["emissions","climate","decarbonization","carbon","scope 1","scope 2","scope 3","renewable","transition risk","physical risk","net zero","hydrogen"],
+    "cyber": ["cyber","ransomware","breach","intrusion","malware","ddos","vulnerability","phishing","incident response","soc"],
+    "supply chain": ["supplier","logistics","shipping","lead time","shortage","geopolitical","disruption","inventory"],
+    "litigation": ["litigation","lawsuit","injunction","damages","settlement","class action","legal proceedings"],
+    "financial": ["liquidity","covenant","refinancing","interest rate","fx","currency","credit risk","impairment"],
+    "governance": ["board","audit committee","whistleblower","internal control","sox","governance","oversight"],
+    "operational": ["outage","downtime","operational","manufacturing","capacity","safety","hazard"],
+    "reputational": ["reputation","brand damage","negative publicity","boycott","public perception","media scrutiny"]
 }
 
-RISK_SEEDS = {
-    "Physical climate risk": ["flood", "heatwave", "wildfire", "storm", "drought", "physical risk"],
-    "Transition/regulatory risk": ["carbon tax", "regulation", "legislation", "compliance cost", "cap-and-trade"],
-    "Reputational risk": ["boycott", "reputation", "media scrutiny", "controversy"],
-    "Litigation/compliance risk": ["fine", "penalty", "investigation", "lawsuit", "non-compliance"],
-    "Supply chain risk": ["supplier", "chain disruption", "forced labor", "traceability"],
-    "Data quality/greenwashing risk": ["assurance", "restatement", "omission", "selective", "greenwash", "misleading"],
-}
+# -----------------------------
+# Cached models
+# -----------------------------
+@st.cache_resource(show_spinner=False)
+def get_zero_shot():
+    return pipeline("zero-shot-classification", model="facebook/bart-large-mnli")
 
-LANG_OVERRIDES = {"zh-cn": "zh", "zh-tw": "zh"}
+@st.cache_resource(show_spinner=False)
+def get_sentiment():
+    return pipeline("text-classification", model="ProsusAI/finbert")
+
+@st.cache_resource(show_spinner=False)
+def get_embedder():
+    return SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 
 # -----------------------------
-# Utilities
+# Helpers (app scope)
 # -----------------------------
+def regex_sent_split(txt: str) -> List[str]:
+    parts = re.split(r'(?<=[.!?])\s+(?=[A-Z0-9])', txt.strip())
+    return [p.strip() for p in parts if p.strip()]
 
-@dataclass
-class ReportResult:
-    name: str
-    language: str
-    translated: bool
-    token_count: int
-    coverage: Dict[str, float]  # subtopic -> [0,1]
-    pillar_scores: Dict[str, float]  # E,S,G -> [0,100]
-    overall_score: float  # [0,100]
-    confidence: float  # [0,100]
-    risk_signals: Dict[str, float]  # risk bucket -> [0,100]
-    highlights: List[Tuple[str, str]]  # (subtopic, sentence)
-
-
-def normalize_lang(code: str) -> str:
-    code = (code or "en").lower()
-    return LANG_OVERRIDES.get(code, code)
-
-
-def detect_language(text: str) -> str:
-    try:
-        from langdetect import detect
-        return normalize_lang(detect(text[:2000]))
-    except Exception:
-        return "en"
-
-
-@st.cache_data(show_spinner=False)
-def extract_text_from_pdf(file_bytes: bytes) -> str:
-    """Extract text using PyMuPDF; fall back to a trivial empty string on error."""
-    try:
-        import fitz  # PyMuPDF
-        with fitz.open(stream=file_bytes, filetype="pdf") as doc:
-            parts = []
-            for page in doc:
-                parts.append(page.get_text("text"))
-        text = "\n".join(parts)
-        return text
-    except Exception as e:
-        st.warning(f"PDF extraction failed: {e}")
-        return ""
-
-
-def translate_text(text: str, src_lang: str, tgt_lang: str = "en") -> Tuple[str, bool]:
-    """Pluggable translation. Defaults to passthrough if English or transformers unavailable.
-    You can set USE_MARIAN_MT=true and a model name via ENV MARIAN_MODEL (e.g., 'Helsinki-NLP/opus-mt-mul-en').
-    """
-    src_lang = normalize_lang(src_lang)
-    if src_lang in ("en", ""):
-        return text, False
-
-    if os.getenv("USE_MARIAN_MT", "false").lower() == "true" and TRANSFORMERS_OK:
-        try:
-            from transformers import MarianMTModel, MarianTokenizer
-            model_name = os.getenv("MARIAN_MODEL", "Helsinki-NLP/opus-mt-mul-en")
-            tokenizer = MarianTokenizer.from_pretrained(model_name)
-            model = MarianMTModel.from_pretrained(model_name)
-            chunks = chunk_text(text, max_tokens=400)
-            translated_chunks = []
-            for ch in chunks:
-                inputs = tokenizer(ch, return_tensors="pt", padding=True, truncation=True)
-                outputs = model.generate(**inputs, max_new_tokens=400)
-                translated = tokenizer.batch_decode(outputs, skip_special_tokens=True)
-                translated_chunks.extend(translated)
-            return "\n".join(translated_chunks), True
-        except Exception as e:
-            st.warning(f"Translation fallback (pass-through). Error: {e}")
-            return text, False
-    else:
-        # Hook up a commercial API here if desired; keep passthrough as default
-        return text, False
-
-
-def chunk_text(text: str, max_tokens: int = 400) -> List[str]:
-    # Rough splitter by sentences; productionize as needed
-    sents = re.split(r"(?<=[\.!?])\s+", text)
-    chunks, cur = [], []
-    count = 0
-    for s in sents:
-        tokens = len(s.split())
-        if count + tokens > max_tokens and cur:
-            chunks.append(" ".join(cur))
-            cur, count = [s], tokens
-        else:
-            cur.append(s)
-            count += tokens
-    if cur:
-        chunks.append(" ".join(cur))
-    return chunks
-
-
-def simple_clean(text: str) -> str:
-    text = re.sub(r"\s+", " ", text)
-    text = text.replace("\u00A0", " ")
-    return text.strip()
-
-
-def count_seed_hits(text: str, seeds: List[str]) -> int:
-    hits = 0
-    low = text.lower()
-    for kw in seeds:
-        hits += len(re.findall(rf"\b{re.escape(kw.lower())}\b", low))
-    return hits
-
-
-def score_subtopics(text: str) -> Tuple[Dict[str, float], List[Tuple[str, str]]]:
-    """Return coverage per subtopic in [0,1] based on seed density and top highlights."""
-    # Split into sentences for highlighting
-    sentences = re.split(r"(?<=[\.!?])\s+", text)
-    coverage = {}
-    highlights: List[Tuple[str, str]] = []
-    for sub, seeds in SEEDS.items():
-        hits = [s for s in sentences if any(re.search(rf"\b{re.escape(k)}\b", s, flags=re.I) for k in seeds)]
-        # coverage as clipped density proxy
-        density = min(1.0, np.log1p(sum(count_seed_hits(" ".join(hits), seeds)) + 1) / 5)
-        coverage[sub] = float(density)
-        # keep up to 3 highlights per subtopic
-        for s in hits[:3]:
-            highlights.append((sub, s.strip()))
-    return coverage, highlights
-
-
-def compute_pillar_scores(coverage: Dict[str, float]) -> Dict[str, float]:
-    # Weighted subtopic averages -> pillar score on 0..100
-    pillar_scores = {}
-    for pillar, subs in SUBWEIGHTS.items():
-        val = 0.0
-        for sub, w in subs.items():
-            val += w * coverage.get(sub, 0.0)
-        pillar_scores[pillar] = float(round(val * 100, 2))
-    return pillar_scores
-
-
-def compute_risk_signals(text: str) -> Dict[str, float]:
-    risks: Dict[str, float] = {}
-    for bucket, seeds in RISK_SEEDS.items():
-        hits = count_seed_hits(text, seeds)
-        risks[bucket] = float(min(100.0, hits * 8.0))  # tune scaling
-    return risks
-
-
-def compute_overall(pillar_scores: Dict[str, float]) -> float:
-    return round(
-        sum(DEFAULT_WEIGHTS[p] * pillar_scores.get(p, 0.0) for p in ["E", "S", "G"]), 2
-    )
-
-
-def compute_confidence(coverage: Dict[str, float], token_count: int) -> float:
-    cov = np.mean(list(coverage.values()) or [0])
-    length_factor = min(1.0, np.log1p(max(1, token_count)) / 8)
-    return float(round(100 * (0.6 * cov + 0.4 * length_factor), 2))
-
-
-@st.cache_data(show_spinner=False)
-def analyze_report(name: str, file_bytes: bytes) -> ReportResult:
-    raw_text = extract_text_from_pdf(file_bytes)
-    if not raw_text:
-        raw_text = ""  # OCR placeholder if you integrate pytesseract
-
-    lang = detect_language(raw_text)
-    text_en, translated = translate_text(raw_text, lang, "en")
-
-    text_en = simple_clean(text_en)
-    token_count = len(text_en.split())
-
-    coverage, highlights = score_subtopics(text_en)
-    pillar_scores = compute_pillar_scores(coverage)
-    overall = compute_overall(pillar_scores)
-    risk_signals = compute_risk_signals(text_en)
-    confidence = compute_confidence(coverage, token_count)
-
-    return ReportResult(
-        name=name,
-        language=lang,
-        translated=translated,
-        token_count=token_count,
-        coverage=coverage,
-        pillar_scores=pillar_scores,
-        overall_score=overall,
-        confidence=confidence,
-        risk_signals=risk_signals,
-        highlights=highlights,
-    )
-
-
-# -----------------------------
-# UI Components
-# -----------------------------
-
-st.title("🌍 ESG Analyzer: Multilingual Sustainability Report Scoring")
-
-with st.sidebar:
-    st.header("Upload reports")
-    files = st.file_uploader(
-        "Upload one or more PDF sustainability reports",
-        type=["pdf"],
-        accept_multiple_files=True,
-    )
-    st.markdown("---")
-    st.subheader("Scoring weights")
-    wE = st.slider("Weight: Environment (E)", 0.0, 1.0, DEFAULT_WEIGHTS["E"], 0.05)
-    wS = st.slider("Weight: Social (S)", 0.0, 1.0, DEFAULT_WEIGHTS["S"], 0.05)
-    wG = st.slider("Weight: Governance (G)", 0.0, 1.0, DEFAULT_WEIGHTS["G"], 0.05)
-    tot = wE + wS + wG
-    if abs(tot - 1.0) > 1e-6:
-        st.info("Weights auto-normalized to sum to 1.0")
-    total = max(1e-9, wE + wS + wG)
-    DEFAULT_WEIGHTS.update({"E": wE / total, "S": wS / total, "G": wG / total})
-
-    st.subheader("Export")
-    want_export = st.toggle("Enable CSV/JSON export", value=True)
-
-st.markdown(
-    "This demo uses seed-based coverage and risk lexicons for transparency and speed. "
-    "You can plug in zero-shot classifiers or domain models under the hood for more nuance."
-)
-
-if files:
-    results: List[ReportResult] = []
-    progress = st.progress(0.0, text="Analyzing...")
-    for i, f in enumerate(files):
-        progress.progress((i + 1) / len(files), text=f"Analyzing {f.name} ({i+1}/{len(files)})")
-        data = f.read()
-        res = analyze_report(f.name, data)
-        results.append(res)
-    progress.empty()
-
-    # ------- Overview table
-    st.subheader("Overview & Ratings")
+def parse_input(uploaded_files) -> pd.DataFrame:
+    """Return unified dataframe with columns: source,page,section,text."""
     rows = []
-    for r in results:
-        rows.append(
-            {
-                "Report": r.name,
-                "Language": r.language + (" → en" if r.translated else ""),
-                "Tokens": r.token_count,
-                "E": r.pillar_scores["E"],
-                "S": r.pillar_scores["S"],
-                "G": r.pillar_scores["G"],
-                "Overall": r.overall_score,
-                "Confidence": r.confidence,
-            }
-        )
-    df = pd.DataFrame(rows).sort_values("Overall", ascending=False)
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    for uf in uploaded_files:
+        name = uf.name.lower()
+        if name.endswith(".pdf"):
+            rows.extend(read_pdf_bytes(uf.read(), uf.name))
+        elif name.endswith(".csv"):
+            df = pd.read_csv(uf)
+            if "text" not in df.columns:
+                st.error("CSV must include a 'text' column."); st.stop()
+            for _, r in df.iterrows():
+                rows.append({
+                    "source": r.get("source", uf.name),
+                    "page": r.get("page", np.nan),
+                    "section": r.get("section", ""),
+                    "text": str(r["text"])
+                })
+        else:  # txt
+            txt = uf.read().decode("utf-8", errors="ignore")
+            for sent in regex_sent_split(txt):
+                rows.append({"source": uf.name, "page": np.nan, "section": "", "text": sent})
+    return pd.DataFrame(rows)
 
-    # ------- Comparison selector
-    st.markdown("---")
-    st.subheader("Compare reports")
-    choices = [r.name for r in results]
-    sel = st.multiselect("Pick 2–5 reports to compare", choices, default=choices[: min(3, len(choices))])
+def lexicon_hits(s: str) -> Dict[str, int]:
+    s_low = s.lower()
+    return {lab: sum(1 for kw in kws if kw in s_low) for lab, kws in LEXICON.items()}
 
-    if len(sel) >= 1:
-        # Radar per report (E,S,G)
-        radar_cols = ["E", "S", "G"]
-        radar_df = df[df["Report"].isin(sel)][["Report"] + radar_cols]
-        fig = go.Figure()
-        categories = radar_cols
-        for _, row in radar_df.iterrows():
-            fig.add_trace(
-                go.Scatterpolar(r=row[radar_cols].tolist(), theta=categories, fill="toself", name=row["Report"]) 
-            )
-        fig.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0, 100])), showlegend=True, height=500)
-        st.plotly_chart(fig, use_container_width=True)
+def score_chunk(zero_shot, sentiment_clf, chunk: str) -> Dict[str, Any]:
+    zs = zero_shot(chunk, candidate_labels=RISK_LABELS, multi_label=True)
+    sent = sentiment_clf(chunk, truncation=True)[0]
+    sign = {"POSITIVE": 1, "NEGATIVE": -1, "NEUTRAL": 0}.get(sent["label"], 0)
+    sent_score = sign * float(sent["score"])
 
-        # Risk heatmap
-        risk_rows = []
-        for r in results:
-            if r.name in sel:
-                entry = {"Report": r.name}
-                entry.update(r.risk_signals)
-                risk_rows.append(entry)
-        risk_df = pd.DataFrame(risk_rows).set_index("Report").T
-        heat = px.imshow(risk_df, aspect="auto", origin="lower", labels=dict(color="Risk signal (0–100)"))
-        st.plotly_chart(heat, use_container_width=True)
+    hits = lexicon_hits(chunk)
+    zs_scores = dict(zip(zs["labels"], zs["scores"]))
+    boosted = {lab: zs_scores.get(lab, 0.0) + 0.05 * hits.get(lab, 0) for lab in RISK_LABELS}
+    top_lab = max(boosted, key=boosted.get)
+    risk_conf = boosted[top_lab]
 
-    # ------- Drill-down per report
-    st.markdown("---")
-    st.subheader("Drill-down: coverage & highlights")
-    for r in results:
-        with st.expander(f"🔎 {r.name}"):
-            c1, c2, c3 = st.columns([1, 1, 1])
-            with c1:
-                st.metric("Overall score", r.overall_score)
-                st.metric("Confidence", r.confidence)
-                st.write("**Language**:", r.language, "**Translated**:", "Yes" if r.translated else "No")
-            with c2:
-                cov_df = pd.DataFrame({"Subtopic": list(r.coverage.keys()), "Coverage (0–1)": list(r.coverage.values())})
-                st.bar_chart(cov_df.set_index("Subtopic"))
-            with c3:
-                p_df = pd.DataFrame({"Pillar": ["E", "S", "G"], "Score": [r.pillar_scores["E"], r.pillar_scores["S"], r.pillar_scores["G"]]})
-                st.bar_chart(p_df.set_index("Pillar"))
+    total_hits = sum(hits.values())
+    severity = 1/(1+np.exp(-(3*abs(sent_score) + 1.5*risk_conf + 0.5*np.log1p(total_hits))))
 
-            st.markdown("**Risk signals**")
-            r_df = pd.DataFrame({"Bucket": list(r.risk_signals.keys()), "Signal": list(r.risk_signals.values())})
-            st.bar_chart(r_df.set_index("Bucket"))
-
-            st.markdown("**Source highlights (by subtopic)**")
-            for sub, sent in r.highlights[:30]:
-                st.markdown(f"- **{sub}**: {sent}")
-
-    # ------- Export
-    if want_export:
-        out = {
-            "results": [asdict(r) for r in results],
-            "weights": DEFAULT_WEIGHTS,
-            "timestamp": time.time(),
+    return {
+        "pred_label": top_lab,
+        "risk_conf": float(risk_conf),
+        "sentiment_label": sent["label"],
+        "sentiment_score": float(sent_score),
+        "lexicon_hits": hits,
+        "severity": float(severity),
+        "zs_scores": {lab: float(zs_scores.get(lab, 0.0)) for lab in RISK_LABELS},
+        "severity_parts": {
+            "sent_mag": float(abs(sent_score)),
+            "risk_conf": float(risk_conf),
+            "lex_density": float(np.log1p(total_hits))
         }
-        json_bytes = json.dumps(out, indent=2).encode("utf-8")
-        st.download_button(
-            "Download JSON results",
-            data=json_bytes,
-            file_name="esg_analysis.json",
-            mime="application/json",
-        )
-        flat_rows = []
-        for r in results:
-            base = {
-                "Report": r.name,
-                "Language": r.language,
-                "Translated": r.translated,
-                "Tokens": r.token_count,
-                "Overall": r.overall_score,
-                "Confidence": r.confidence,
-            }
-            # Add pillars
-            for k, v in r.pillar_scores.items():
-                base[f"{k}"] = v
-            # Add risks
-            for k, v in r.risk_signals.items():
-                base[f"Risk::{k}"] = v
-            flat_rows.append(base)
-        csv_bytes = pd.DataFrame(flat_rows).to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "Download CSV summary",
-            data=csv_bytes,
-            file_name="esg_summary.csv",
-            mime="text/csv",
-        )
-else:
-    st.info("Upload one or more PDF reports to get started. Supported languages auto-detected; translation to English is optional and pluggable.")
+    }
+
+def cluster_embeddings(emb, k=6):
+    km = KMeans(n_clusters=k, random_state=42, n_init="auto")
+    return km.fit_predict(emb)
+
+def highlight_lexicon(text: str, label: str) -> str:
+    kws = LEXICON.get(label, [])
+    out = text
+    for kw in sorted(kws, key=len, reverse=True):
+        pattern = re.compile(re.escape(kw), flags=re.IGNORECASE)
+        out = pattern.sub(lambda m: f"<mark>{m.group(0)}</mark>", out)
+    return out
+
+def build_pdf_report(path: str, summary_df: pd.DataFrame, top_items: pd.DataFrame, title="RiskRanger Report"):
+    c = canvas.Canvas(path, pagesize=A4)
+    W, H = A4
+    y = H - 2*cm
+    c.setFont("Helvetica-Bold", 16); c.drawString(2*cm, y, title); y -= 0.8*cm
+    c.setFont("Helvetica", 10); c.drawString(2*cm, y, "Automated risk extraction and scoring"); y -= 1.0*cm
+
+    c.setFont("Helvetica-Bold", 12); c.drawString(2*cm, y, "Summary by label"); y -= 0.6*cm
+    c.setFont("Helvetica", 9)
+    for _, r in summary_df.head(8).iterrows():
+        line = f"{r['pred_label']:<15} | n={int(r['n'])} | avg_sev={r['avg_severity']:.2f} | high={int(r['high_count'])}"
+        c.drawString(2*cm, y, line); y -= 0.45*cm
+        if y < 3*cm: c.showPage(); y = H - 2*cm
+
+    y -= 0.2*cm
+    c.setFont("Helvetica-Bold", 12); c.drawString(2*cm, y, "Top risks"); y -= 0.6*cm
+    c.setFont("Helvetica", 9)
+    for _, r in top_items.head(6).iterrows():
+        c.drawString(2*cm, y, f"{r['pred_label']} | sev={r['severity']:.2f} | conf={r['risk_conf']:.2f} | {str(r.get('source'))} p.{str(r.get('page'))}"); y -= 0.45*cm
+        txt = (r['text'] or "")[:600].replace("\n"," ")
+        for chunk in [txt[i:i+100] for i in range(0, len(txt), 100)]:
+            c.drawString(2.5*cm, y, chunk); y -= 0.38*cm
+            if y < 3*cm: c.showPage(); y = H - 2*cm
+        y -= 0.2*cm
+        if y < 3*cm: c.showPage(); y = H - 2*cm
+    c.save()
 
 # -----------------------------
-# Notes for further improvement (dev checklist)
+# Sidebar controls
 # -----------------------------
-# - Swap seed-based scoring for:
-#   (a) Zero-shot topic classification (e.g., BART MNLI) to assign sentences to subtopics.
-#   (b) A multilingual sentiment or stance model to weigh positive/negative disclosures.
-#   (c) Named entity + event extraction to surface controversies with dates and amounts.
-# - Map disclosures to frameworks (CSRD/ESRS, GRI, SASB, TCFD) using a label taxonomy.
-# - Add OCR (pytesseract) for scanned PDFs.
-# - Add deduplication of boilerplate and tables (e.g., filtering lines with too many digits/symbols).
-# - Calibrate scoring with a gold dataset; normalize by sector (GICS/NAICS) using peer medians.
-# - Add an explainability panel that shows which sentences most influenced each pillar score.
-# - Persist results to a database and allow time-series tracking across years.
+st.sidebar.header("Upload documents")
+uploaded_files = st.sidebar.file_uploader(
+    "Upload PDF / CSV (needs 'text') / TXT",
+    type=["pdf","csv","txt"], accept_multiple_files=True
+)
+k_clusters = st.sidebar.slider("Clusters (dedupe similar risks)", 2, 12, 6, 1)
+top_n = st.sidebar.slider("Top-N highest severity", 3, 20, 8, 1)
+
+# -----------------------------
+# Ingest
+# -----------------------------
+if uploaded_files:
+    df_in = parse_input(uploaded_files)
+else:
+    st.info("No files uploaded — try with a PDF, CSV (with a 'text' column), or TXT.")
+    st.stop()
+
+if df_in.empty:
+    st.warning("No text found."); st.stop()
+
+# Language detection + translation to English for analysis
+with st.spinner("Detecting language & translating (if needed)..."):
+    translator = get_translator()
+    langs, texts_en, was_translated = [], [], []
+    for t in df_in["text"].astype(str).tolist():
+        lang = detect_lang_safe(t)
+        langs.append(lang)
+        if lang not in ("en","unknown"):
+            t_en, flag = translate_to_en(t, translator)
+        else:
+            t_en, flag = t, False
+        texts_en.append(t_en)
+        was_translated.append(flag)
+    df_in["language"] = langs
+    df_in["text_en"] = texts_en
+    df_in["translated"] = was_translated
+
+# -----------------------------
+# Models
+# -----------------------------
+with st.spinner("Loading models (first run downloads weights)..."):
+    zero_shot = get_zero_shot()
+    sentiment = get_sentiment()
+    embedder = get_embedder()
+
+# -----------------------------
+# Scoring
+# -----------------------------
+with st.spinner("Scoring paragraphs..."):
+    records = []
+    texts = df_in["text_en"].astype(str).tolist()
+    for i, t in enumerate(texts):
+        meta = score_chunk(zero_shot, sentiment, t)
+        row = df_in.iloc[i].to_dict(); row.update(meta)
+        records.append(row)
+    df = pd.DataFrame(records)
+
+# Flatten lexicon hits
+lex_cols = sorted({k for d in df["lexicon_hits"] for k in d.keys()})
+for c in lex_cols:
+    df[f"lex_{c}"] = df["lexicon_hits"].apply(lambda d: d.get(c,0))
+df.drop(columns=["lexicon_hits"], inplace=True)
+
+# -----------------------------
+# Embeddings & clustering
+# -----------------------------
+with st.spinner("Embedding & clustering similar risks..."):
+    emb = embedder.encode(df["text_en"].tolist(), normalize_embeddings=True, convert_to_numpy=True)
+    df["cluster"] = cluster_embeddings(emb, k_clusters)
+
+# -----------------------------
+# Dashboard tabs
+# -----------------------------
+st.subheader("Dashboard")
+tab_overview, tab_top, tab_map = st.tabs(["📊 Overview", "🚩 Top Risks", "🗺️ Risk Landscape"])
+
+with tab_overview:
+    summary = df.groupby("pred_label").agg(
+        n=("text","size"),
+        avg_severity=("severity","mean"),
+        high_count=("severity", lambda s: (s>0.75).sum())
+    ).sort_values(["high_count","avg_severity","n"], ascending=False).reset_index()
+    st.dataframe(summary, use_container_width=True)
+    st.caption("Counts, average severity, and number of high-severity (>0.75) items by label.")
+
+with tab_top:
+    # filters
+    flabel = st.multiselect("Filter by label", options=sorted(df["pred_label"].unique()))
+    fsrc = st.multiselect("Filter by source", options=sorted(df["source"].astype(str).unique()))
+    fmin = st.slider("Min severity", 0.0, 1.0, 0.0, 0.05)
+    filtered = df.copy()
+    if flabel: filtered = filtered[filtered["pred_label"].isin(flabel)]
+    if fsrc:   filtered = filtered[filtered["source"].astype(str).isin(fsrc)]
+    filtered = filtered[filtered["severity"] >= fmin]
+
+    top_df = filtered.sort_values("severity", ascending=False).head(top_n)
+    st.dataframe(
+        top_df[["source","section","page","pred_label","risk_conf","sentiment_label","sentiment_score","severity","text"]],
+        use_container_width=True
+    )
+
+    # explainability per row
+    for row in top_df.to_dict("records"):
+        with st.expander(f"{row['pred_label']} | sev={row['severity']:.2f} | {str(row.get('source'))} p.{row.get('page','')}"):
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown("**Severity breakdown**")
+                parts = row["severity_parts"]
+                st.write({
+                    "sentiment_magnitude": parts["sent_mag"],
+                    "risk_confidence": parts["risk_conf"],
+                    "lexicon_density_log": parts["lex_density"]
+                })
+            with col2:
+                st.markdown("**Zero-shot scores**")
+                zdf = pd.DataFrame(list(row["zs_scores"].items()), columns=["label","score"]).sort_values("score", ascending=False)
+                st.bar_chart(zdf.set_index("label"))
+            st.markdown("**Highlighted text**")
+            st.markdown(highlight_lexicon(row["text"], row["pred_label"]), unsafe_allow_html=True)
+            if row.get("translated", False):
+                st.caption(f"Translated from {row.get('language','unknown')} → English for analysis.")
+
+with tab_map:
+    pca = PCA(n_components=2, random_state=42)
+    coords = pca.fit_transform(emb)
+    viz = pd.DataFrame({
+        "x": coords[:,0], "y": coords[:,1],
+        "label": df["pred_label"], "severity": df["severity"],
+        "text": df["text"], "source": df["source"]
+    })
+    fig = px.scatter(
+        viz, x="x", y="y", color="label",
+        size=viz["severity"]*10+3,
+        hover_data=["source","text","severity"],
+        title="Risk landscape (PCA of embeddings)"
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+# -----------------------------
+# Exports
+# -----------------------------
+st.subheader("Export")
+csv_bytes = df.to_csv(index=False).encode("utf-8")
+st.download_button("Download full results (CSV)", csv_bytes, file_name="riskranger_output.csv", mime="text/csv")
+
+report_path = "riskranger_report.pdf"
+# ensure summary/top_df exist
+try:
+    _ = summary
+except NameError:
+    summary = df.groupby("pred_label").agg(
+        n=("text","size"),
+        avg_severity=("severity","mean"),
+        high_count=("severity", lambda s: (s>0.75).sum())
+    ).sort_values(["high_count","avg_severity","n"], ascending=False).reset_index()
+try:
+    _ = top_df
+except NameError:
+    top_df = df.sort_values("severity", ascending=False).head(top_n)
+
+build_pdf_report(report_path, summary, top_df)
+with open(report_path, "rb") as f:
+    st.download_button("Download press-ready PDF report", f, file_name="riskranger_report.pdf", mime="application/pdf")
+
+st.info("Models: facebook/bart-large-mnli (zero-shot), ProsusAI/finbert (sentiment), all-MiniLM-L6-v2 (embeddings). Reproducible clustering with random_state=42.")
+
